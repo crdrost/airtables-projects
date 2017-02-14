@@ -92,17 +92,17 @@ rec &. (TC t c s) = TC t c (rec : s)
 (&?) :: RecordID -> ThreadContext -> Bool
 rec &? ctx = not . null . filter (== rec) . subpath $ ctx
 
--- Now for the trickier logic, we need to get all of a thread's child-threads, so long as they do 
--- not generate cycles and are in the list of active threads. We also want to sort by .
+-- Now for the trickier logic, we need to get all of a thread's child-threads, so long as they do
+-- not generate cycles and are in the list of active threads. We also want to sort by percentage.
 threadChildren :: ThreadContext -> Thread -> [(RecordID, Thread, Percentage)]
 threadChildren ctx = sortArrange . List.nub . maybeFilter . map process . map getContainment . tContainments
     where
         -- postprocess by sorting. We lazily use -Percentage to sort descending, so arrange that
-        -- back into the last spot with a nonnegaive value.
+        -- back into the last spot with a non-negative value.
         sortArrange :: [(Double, Thread, RecordID)] -> [(RecordID, Thread, Percentage)]
         sortArrange = map rearrange . List.sort where
             rearrange (completion, thread, record) = (record, thread, -completion)
-        
+
         -- use the Maybe monad like a filter to produce a list of xs. 
         maybeFilter :: [Maybe x] -> [x]
         maybeFilter = concatMap (maybe [] (:[]))
@@ -110,9 +110,9 @@ threadChildren ctx = sortArrange . List.nub . maybeFilter . map process . map ge
         process :: Containment -> Maybe (Double, Thread, RecordID)
         process c = do
             let record = containee c
-            -- drop cycles if they exist
+            -- drop cycles if they exist:
             rec_id <- case record &? ctx of True -> Nothing; False -> Just record
-            -- check to make sure it's in the active nodes
+            -- check to make sure it's in the active nodes:
             thread <- selectMaybe (threads ctx) rec_id
             return (-percentage c, thread, rec_id)
        
@@ -121,12 +121,12 @@ threadChildren ctx = sortArrange . List.nub . maybeFilter . map process . map ge
 
 -- That's fine but it does not actually produce the recursive data structure, so here's where we
 -- recurse on descendants to produce the whole Outline from a given (RecordID, Thread) pair:
-outlineFromThread :: ThreadContext -> (RecordID, Thread, Double) -> Outline
-outlineFromThread ctx (record, thread, completeness) = result where
+outlineFromThread :: ThreadContext -> (RecordID, Thread, Percentage) -> Outline
+outlineFromThread ctx (record, thread, percentage) = result where
     result = Outline processName processDescr processStatus children
     processName = prefix ++ unpack (tName thread) where
         prefix 
-           | completeness /= 100 = "[" ++ show (round completeness) ++ "%] " 
+           | percentage /= 100 = "[" ++ show (round percentage) ++ "%] " 
            | otherwise           = ""
     processStatus
         | tStatus thread == "Done" = Just "true" 
@@ -147,6 +147,7 @@ instance XmlPickler Outline where
                        (xpOption (xpAttr "_complete" xpText))
                        (xpList xpickle)
 
+-- container for the non-<outline> XML structure here
 data OPML = OPML {version :: String, ownerEmail :: String, outline :: Outline } deriving (Show)
 instance XmlPickler OPML where
     xpickle = xpOPML
@@ -157,9 +158,12 @@ xpOPML = xpElem "opml" $
                   (xpElem "head" $ xpElem "ownerEmail" xpText)
                   (xpElem "body" $ xpickle)
 
+-- initialize the first Threads to have 100% containment so that they do not have percentage blurbs
+-- in their names.
 containmentOneHundred :: (a, b) -> (a, b, Double)
 containmentOneHundred (a, b) = (a, b, 100)
 
+-- we were passed valid options? Great, let's run with them!
 runMain :: AirtableOptions -> IO ()
 runMain creds = do
     activeThreads <- activeNodes <$> getTable creds "Threads"
@@ -172,6 +176,7 @@ runMain creds = do
         >>> xpickleDocument xpOPML [withIndent yes] "")
     return ()
 
+-- we were not passed valid options? Then let's just print some usage info. 
 printUsage :: IO ()
 printUsage = do
     putStrLn "Usage: airtables-projects <key> <airtable>"
@@ -179,6 +184,7 @@ printUsage = do
     putStrLn "Prints a 'Threads' and 'Containments' database as an OPML file describing a Workflowy tree."
     putStrLn "This executable prints to stdout."
 
+-- dispatcher to the above two methods.
 main :: IO ()
 main = do
     args <- getArgs
