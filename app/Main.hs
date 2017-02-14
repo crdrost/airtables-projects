@@ -36,13 +36,15 @@ instance FromJSON Thread where
                                   <*> getWithDefault f "Status" ""
     parseJSON _ = fail "Threads must be JSON objects."
 
+type Percentage = Double 
 -- The Containment type contained in the Airtable
 data Containment = Containment {
     cLabel :: !Text,
     container :: !RecordID, -- of a Thread!
     containee :: !RecordID, -- also of a Thread!
-    completion :: !Double
+    percentage :: !Percentage
 } deriving (Show)
+
 
 -- Question: The existing schema has the schema possibility of a Thread or Subthread containing
 -- zero or multiple elements; I am assuming that they associate exactly one Thread with one 
@@ -79,7 +81,7 @@ data Outline = Outline {
 
 -- we're going to pass these contexts down through the walk through our Threads; the important part
 -- is the subpath to detect cycles, the rest could have been done with lexical scoping...
-data ThreadContext = TC {threads :: !(Table Thread), containment :: !(Table Containment), subpath :: ![RecordID]}
+data ThreadContext = TC {threads :: !(Table Thread), containments :: !(Table Containment), subpath :: ![RecordID]}
 
 -- could also do this with lenses I suppose...
 -- rec &. ctx  ==  "give me a new context with rec in it."
@@ -91,36 +93,42 @@ rec &. (TC t c s) = TC t c (rec : s)
 rec &? ctx = not . null . filter (== rec) . subpath $ ctx
 
 -- Now for the trickier logic, we need to get all of a thread's child-threads, so long as they do 
--- not generate cycles and are in the list of active threads. We also want to sort by completion.
-threadChildren :: ThreadContext -> Thread -> [(RecordID, Thread)]
-threadChildren ctx = removeComp . concatMap compThread . map (select $ containment ctx) . tContainments
+-- not generate cycles and are in the list of active threads. We also want to sort by .
+threadChildren :: ThreadContext -> Thread -> [(RecordID, Thread, Percentage)]
+threadChildren ctx = sortArrange . List.nub . maybeFilter . map process . map getContainment . tContainments
     where
-        -- postprocess by sorting, then removing the completion that was used for sorting.
-        removeComp :: [(Double, Thread, RecordID)] -> [(RecordID, Thread)]
-        removeComp = map removal . List.sort where
-            removal (completion, thread, record) = (record, thread)
+        -- postprocess by sorting. We lazily use -Percentage to sort descending, so arrange that
+        -- back into the last spot with a nonnegaive value.
+        sortArrange :: [(Double, Thread, RecordID)] -> [(RecordID, Thread, Percentage)]
+        sortArrange = map rearrange . List.sort where
+            rearrange (completion, thread, record) = (record, thread, -completion)
+        
+        -- use the Maybe monad like a filter to produce a list of xs. 
+        maybeFilter :: [Maybe x] -> [x]
+        maybeFilter = concatMap (maybe [] (:[]))
 
-        -- map each containment to either 0 or 1 triples, which are all concatted via concatMap.
-        -- essentially filters out the Nothings while mapping the Justs to their triples.
-        compThread :: Containment -> [(Double, Thread, RecordID)]
-        compThread c = maybe [] (\t -> [(completion c, t, containee c)]) $ maybeThread c
-
-        -- as part of the above: map each containment to a thread if one exists and is not a cycle.
-        maybeThread :: Containment -> Maybe Thread
-        maybeThread c = dropCycles (containee c) >>= selectMaybe (threads ctx)
-
-        -- finally, check for cycles in the parents of the current path...
-        dropCycles :: RecordID -> Maybe RecordID
-        dropCycles record 
-            | record &? ctx = Nothing     -- TODO: insert fake records to notify about cycles?
-            | otherwise     = Just record
+        process :: Containment -> Maybe (Double, Thread, RecordID)
+        process c = do
+            let record = containee c
+            -- drop cycles if they exist
+            rec_id <- case record &? ctx of True -> Nothing; False -> Just record
+            -- check to make sure it's in the active nodes
+            thread <- selectMaybe (threads ctx) rec_id
+            return (-percentage c, thread, rec_id)
+       
+        getContainment :: RecordID -> Containment
+        getContainment = select (containments ctx)
 
 -- That's fine but it does not actually produce the recursive data structure, so here's where we
 -- recurse on descendants to produce the whole Outline from a given (RecordID, Thread) pair:
-outlineFromThread :: ThreadContext -> (RecordID, Thread) -> Outline
-outlineFromThread ctx (record, thread) = result where
-    result = Outline (unpack $ tName thread) processDescr processStatus children
-    processStatus 
+outlineFromThread :: ThreadContext -> (RecordID, Thread, Double) -> Outline
+outlineFromThread ctx (record, thread, completeness) = result where
+    result = Outline processName processDescr processStatus children
+    processName = prefix ++ unpack (tName thread) where
+        prefix 
+           | completeness /= 100 = "[" ++ show (round completeness) ++ "%] " 
+           | otherwise           = ""
+    processStatus
         | tStatus thread == "Done" = Just "true" 
         | otherwise                = Nothing
     processDescr 
@@ -139,7 +147,7 @@ instance XmlPickler Outline where
                        (xpOption (xpAttr "_complete" xpText))
                        (xpList xpickle)
 
-data OPML = OPML {version :: String, ownerEmail :: String, outlines :: [Outline] } deriving (Show)
+data OPML = OPML {version :: String, ownerEmail :: String, outline :: Outline } deriving (Show)
 instance XmlPickler OPML where
     xpickle = xpOPML
 
@@ -147,18 +155,20 @@ xpOPML = xpElem "opml" $
          xpWrap (\(a,b,c) -> OPML a b c, \(OPML a b c) -> (a, b, c)) $
          xpTriple (xpAttr "version" xpText)
                   (xpElem "head" $ xpElem "ownerEmail" xpText)
-                  (xpElem "body" $ xpList xpickle)
+                  (xpElem "body" $ xpickle)
 
+containmentOneHundred :: (a, b) -> (a, b, Double)
+containmentOneHundred (a, b) = (a, b, 100)
 
 runMain :: AirtableOptions -> IO ()
 runMain creds = do
     activeThreads <- activeNodes <$> getTable creds "Threads"
     containments <- getTable creds "Containments"
-    let roots = toList $ rootNodes (activeThreads)
+    let roots = map containmentOneHundred . toList $ rootNodes (activeThreads)
     let ctx = TC activeThreads containments []
-    let outlines = map (outlineFromThread ctx) roots
+    let outline = Outline "Airtable Workflowy sample demo" Nothing Nothing $ map (outlineFromThread ctx) roots
     runX (
-        arr (const $ OPML "2.0" "drostie@zoho.com" outlines)
+        arr (const $ OPML "2.0" "zhukeepa@gmail.com" outline)
         >>> xpickleDocument xpOPML [withIndent yes] "")
     return ()
 
